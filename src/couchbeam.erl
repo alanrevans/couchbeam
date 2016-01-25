@@ -6,7 +6,7 @@
 -module(couchbeam).
 -author('Benoît Chesneau <benoitc@e-engura.org>').
 
--include("couchbeam.hrl").
+-include_lib("couchbeam/include/couchbeam.hrl").
 
 -define(TIMEOUT, infinity).
 
@@ -27,7 +27,7 @@
         open_db/2, open_db/3,
         open_or_create_db/2, open_or_create_db/3, open_or_create_db/4,
         delete_db/1, delete_db/2,
-        db_info/1,
+        db_info/1, design_info/2,
         save_doc/2, save_doc/3,
         doc_exists/2,
         open_doc/2, open_doc/3,
@@ -40,7 +40,8 @@
         delete_attachment/4, put_attachment/4, put_attachment/5,
         all_docs/1, all_docs/2, view/2, view/3,
         ensure_full_commit/1, ensure_full_commit/2,
-        compact/1, compact/2]).
+        compact/1, compact/2, view_cleanup/1
+        ]).
 
 
 %% --------------------------------------------------------------------
@@ -50,7 +51,7 @@
 %% @doc Start the couchbeam process. Useful when testing using the shell.
 start() ->
     couchbeam_deps:ensure(),
-    application:load(couchbeam),
+    _ = application:load(couchbeam),
     couchbeam_util:start_app_deps(couchbeam),
     application:start(couchbeam).
 
@@ -138,7 +139,7 @@ server_info(#server{options=IbrowseOpts}=Server) ->
     Url = binary_to_list(iolist_to_binary(server_url(Server))),
     case couchbeam_httpc:request(get, Url, ["200"], IbrowseOpts) of
         {ok, _Status, _Headers, Body} ->
-            Version = couchbeam_ejson:decode(Body),
+            Version = ejson:decode(Body),
             {ok, Version};
         Error -> Error
     end.
@@ -170,15 +171,13 @@ get_uuids(Server, Count) ->
 replicate(#server{options=IbrowseOpts}=Server, RepObj) ->
     Url = make_url(Server, "_replicate", []),
     Headers = [{"Content-Type", "application/json"}],
-    JsonObj = couchbeam_ejson:encode(RepObj),
+    JsonObj = ejson:encode(RepObj),
 
-     case couchbeam_httpc:request(post, Url, ["200", "201"], IbrowseOpts,
-                                  Headers, JsonObj) of
-        {ok, _, _, Body} ->
-            Res = couchbeam_ejson:decode(Body),
-            {ok, Res};
-        Error ->
-            Error
+    case couchbeam_httpc:request_stream({self(), once}, post, Url, IbrowseOpts, Headers,
+            JsonObj) of
+        {ok, ReqId} ->
+            couchbeam_changes:wait_for_change(ReqId);
+        {error, Error} -> {error, Error}
     end.
 
 %% @doc Handle replication.
@@ -210,7 +209,7 @@ all_dbs(#server{options=IbrowseOpts}=Server) ->
     Url = make_url(Server, "_all_dbs", []),
     case couchbeam_httpc:request(get, Url, ["200"], IbrowseOpts) of
         {ok, _, _, Body} ->
-            AllDbs = couchbeam_ejson:decode(Body),
+            AllDbs = ejson:decode(Body),
             {ok, AllDbs};
         Error ->
             Error
@@ -249,7 +248,7 @@ create_db(Server, DbName, Options) ->
 create_db(#server{options=IbrowseOpts}=Server, DbName, Options, Params) ->
     Options1 = couchbeam_util:propmerge1(Options, IbrowseOpts),
     Url = make_url(Server, dbname(DbName), Params),
-    case couchbeam_httpc:request(put, Url, ["201"], Options1) of
+    case couchbeam_httpc:request(put, Url, ["201", "202"], Options1) of
         {ok, _Status, _Headers, _Body} ->
             {ok, #db{server=Server, name=DbName, options=Options1}};
         {error, {ok, "412", _, _}} ->
@@ -309,7 +308,7 @@ delete_db(#server{options=IbrowseOpts}=Server, DbName) ->
     Url = make_url(Server, dbname(DbName), []),
     case couchbeam_httpc:request(delete, Url, ["200"], IbrowseOpts) of
         {ok, _, _, Body} ->
-            {ok, couchbeam_ejson:decode(Body)};
+            {ok, ejson:decode(Body)};
         Error ->
             Error
     end.
@@ -320,12 +319,23 @@ db_info(#db{server=Server, name=DbName, options=IbrowseOpts}) ->
     Url = make_url(Server, DbName, []),
     case couchbeam_httpc:request(get, Url, ["200"], IbrowseOpts) of
         {ok, _Status, _Headers, Body} ->
-            Infos = couchbeam_ejson:decode(Body),
+            Infos = ejson:decode(Body),
             {ok, Infos};
         {error, {ok, "404", _, _}} ->
             {error, db_not_found};
        Error ->
           Error
+    end.
+
+design_info(#db{server=Server, options=IbrowseOpts}=Db, DesignDoc) ->
+    Url = make_url(Server, [db_url(Db), "/_design/", DesignDoc, "/_info"], []),
+    case couchbeam_httpc:request(get, Url, ["200"], IbrowseOpts) of
+        {ok, _Status, _Headers, Body} ->
+            {ok, ejson:decode(Body)}; 
+        {error, {ok, "404", _, _}} ->
+            {error, design_not_found};
+        Error ->
+            Error
     end.
 
 %% @doc test if doc with uuid exists in the given db
@@ -352,7 +362,7 @@ open_doc(#db{server=Server, options=IbrowseOpts}=Db, DocId, Params) ->
     Url = make_url(Server, doc_url(Db, DocId1), Params),
     case db_request(get, Url, ["200", "201"], IbrowseOpts) of
         {ok, _, _, Body} ->
-            {ok, couchbeam_ejson:decode(Body)};
+            {ok, ejson:decode(Body)};
         Error ->
             Error
     end.
@@ -385,11 +395,11 @@ save_doc(#db{server=Server, options=IbrowseOpts}=Db, {Props}=Doc, Options) ->
             couchbeam_util:encode_docid(DocId1)
     end,
     Url = make_url(Server, doc_url(Db, DocId), Options),
-    Body = couchbeam_ejson:encode(Doc),
+    Body = ejson:encode(Doc),
     Headers = [{"Content-Type", "application/json"}],
     case db_request(put, Url, ["201", "202"], IbrowseOpts, Headers, Body) of
         {ok, _, _, RespBody} ->
-            {JsonProp} = couchbeam_ejson:decode(RespBody),
+            {JsonProp} = ejson:decode(RespBody),
             NewRev = couchbeam_util:get_value(<<"rev">>, JsonProp),
             NewDocId = couchbeam_util:get_value(<<"id">>, JsonProp),
             Doc1 = couchbeam_doc:set_value(<<"_rev">>, NewRev,
@@ -455,21 +465,21 @@ save_docs(#db{server=Server, options=IbrowseOpts}=Db, Docs, Options) ->
     {Options2, Body} = case couchbeam_util:get_value("all_or_nothing",
             Options1, false) of
         true ->
-            Body1 = couchbeam_ejson:encode({[
+            Body1 = ejson:encode({[
                 {<<"all_or_nothing">>, true},
                 {<<"docs">>, Docs1}
             ]}),
 
             {proplists:delete("all_or_nothing", Options1), Body1};
         _ ->
-            Body1 = couchbeam_ejson:encode({[{<<"docs">>, Docs1}]}),
+            Body1 = ejson:encode({[{<<"docs">>, Docs1}]}),
             {Options1, Body1}
         end,
     Url = make_url(Server, [db_url(Db), "/", "_bulk_docs"], Options2),
     Headers = [{"Content-Type", "application/json"}],
-    case db_request(post, Url, ["201"], IbrowseOpts, Headers, Body) of
+    case db_request(post, Url, ["201", "202"], IbrowseOpts, Headers, Body) of
         {ok, _, _, RespBody} ->
-            {ok, couchbeam_ejson:decode(RespBody)};
+            {ok, ejson:decode(RespBody)};
         Error ->
             Error
         end.
@@ -588,9 +598,9 @@ put_attachment(#db{server=Server, options=IbrowseOpts}=Db, DocId, Name, Body, Op
             couchbeam_util:encode_docid(DocId), "/",
             couchbeam_util:encode_att_name(Name)], QueryArgs),
 
-    case db_request(put, Url, ["201"], IbrowseOpts, FinalHeaders, Body) of
+    case db_request(put, Url, ["201", "202"], IbrowseOpts, FinalHeaders, Body) of
         {ok, _, _, RespBody} ->
-            {[{<<"ok">>, true}|R]} = couchbeam_ejson:decode(RespBody),
+            {[{<<"ok">>, true}|R]} = ejson:decode(RespBody),
             {ok, {R}};
         Error ->
             Error
@@ -625,9 +635,9 @@ delete_attachment(#db{server=Server, options=IbrowseOpts}=Db, DocOrDocId, Name, 
                     Options1
             end,
             Url = make_url(Server, [db_url(Db), "/", DocId, "/", Name], Options2),
-            case db_request(delete, Url, ["200"], IbrowseOpts) of
+            case db_request(delete, Url, ["200", "202"], IbrowseOpts) of
             {ok, _, _, RespBody} ->
-                {[{<<"ok">>,true}|R]} = couchbeam_ejson:decode(RespBody),
+                {[{<<"ok">>,true}|R]} = ejson:decode(RespBody),
                 {ok, {R}};
 
             Error ->
@@ -709,7 +719,7 @@ view(#db{server=Server}=Db, ViewName, Options) ->
             undefined ->
                 {get, Options1, []};
             Keys ->
-                Body1 = couchbeam_ejson:encode({[{<<"keys">>, Keys}]}),
+                Body1 = ejson:encode({[{<<"keys">>, Keys}]}),
                 {post, proplists:delete("keys", Options1), Body1}
             end,
         Headers = case Method of
@@ -742,7 +752,7 @@ ensure_full_commit(#db{server=Server, options=IbrowseOpts}=Db, Options) ->
     Headers = [{"Content-Type", "application/json"}],
     case db_request(post, Url, ["201"], IbrowseOpts, Headers) of
         {ok, _, _, Body} ->
-            {[{<<"ok">>, true}|R]} = couchbeam_ejson:decode(Body),
+            {[{<<"ok">>, true}|R]} = ejson:decode(Body),
             {ok, R};
         Error ->
             Error
@@ -775,6 +785,16 @@ compact(#db{server=Server, options=IbrowseOpts}=Db, DesignName) ->
             Error
     end.
 
+-spec view_cleanup/1 :: (db()) -> 'ok' | {'error', term()}.
+view_cleanup(#db{server=Server, options=IbrowseOpts}=Db) ->
+    Url = make_url(Server, [db_url(Db), "/_view_cleanup/"], []),
+    Headers = [{"Content-Type", "application/json"}],
+    case db_request(post, Url, ["202"], IbrowseOpts, Headers) of
+        {ok, _, _, _} ->
+            ok;
+        Error ->
+            Error
+    end.
 
 %% --------------------------------------------------------------------
 %% Utilities functions.

@@ -14,9 +14,8 @@
 -export([get_value/2, get_value/3]).
 -export([deprecated/3, shutdown_sync/1]).
 -export([start_app_deps/1, get_app_env/2]).
--export([encode_docid1/1, encode_docid_noop/1]).
 
--define(ENCODE_DOCID_FUNC, encode_docid1).
+-define(ENCODE_DOCID(DocId), encode_docid1(DocId)).
 
 encode_att_name(Name) when is_binary(Name) ->
     encode_att_name(xmerl_ucs:from_utf8(Name));
@@ -29,7 +28,7 @@ encode_att_name(Name) ->
 encode_docid(DocId) when is_binary(DocId) ->
     encode_docid(binary_to_list(DocId));
 encode_docid(DocId)->
-    ?ENCODE_DOCID_FUNC(DocId).
+    ?ENCODE_DOCID(DocId).
 
 encode_docid1(DocId) ->
     case DocId of
@@ -39,9 +38,6 @@ encode_docid1(DocId) ->
         _ ->
             ibrowse_lib:url_encode(DocId)
     end.
-
-encode_docid_noop(DocId) ->
-    DocId.
 
 %% @doc Encode needed value of Query proplists in json
 encode_query([]) ->
@@ -100,7 +96,7 @@ oauth_header(Url, Action, OauthProps) ->
 %% then Fun is called with the key and both values to return a new
 %% value. This a wreapper around dict:merge
 propmerge(F, L1, L2) ->
-	dict:to_list(dict:merge(F, dict:from_list(L1), dict:from_list(L2))).
+        dict:to_list(dict:merge(F, dict:from_list(L1), dict:from_list(L2))).
 
 %% @doc Update a proplist with values of the second. In case the same
 %% key is in 2 proplists, the value from the first are kept.
@@ -116,15 +112,15 @@ get_value(Key, Prop) ->
 -spec(get_value/3 :: (Key :: term(), Prop :: [term()], Default :: term() ) -> term()).
 get_value(Key, Prop, Default) ->
     case lists:keyfind(Key, 1, Prop) of
-	false ->
-	    case lists:member(Key, Prop) of
-		true -> true;
-		false -> Default
-	    end;
-	{Key, V} -> % only return V if a two-tuple is found
-	    V;
-	Other when is_tuple(Other) -> % otherwise return the default
-	    Default
+        false ->
+            case lists:member(Key, Prop) of
+                true -> true;
+                false -> Default
+            end;
+        {Key, V} -> % only return V if a two-tuple is found
+            V;
+        Other when is_tuple(Other) -> % otherwise return the default
+            Default
     end.
 
 %% @doc make view options a list
@@ -211,21 +207,21 @@ shutdown_sync(Pid) ->
 %% @doc Start depedent applications of App.
 start_app_deps(App) ->
     {ok, DepApps} = application:get_key(App, applications),
-    [ensure_started(A) || A <- DepApps],
+    _ = [ensure_started(A) || A <- DepApps],
     ok.
 
 %% @spec ensure_started(Application :: atom()) -> ok
 %% @doc Start the named application if not already started.
 ensure_started(App) ->
     case application:start(App) of
-	ok ->
-	    ok;
-	{error, {already_started, App}} ->
-	    ok
+        ok ->
+            ok;
+        {error, {already_started, App}} ->
+            ok
     end.
 
 get_app_env(Env, Default) ->
-    case application:get_env(couchbeam, Env) of
+    case application:get_env(couch, Env) of
         {ok, Val} -> Val;
         undefined -> Default
     end.

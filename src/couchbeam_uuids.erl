@@ -12,8 +12,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
-
--include("couchbeam.hrl").
+-include_lib("couchbeam/include/couchbeam.hrl").
 
 -record(state, {}).
 
@@ -40,7 +39,7 @@ start_link() ->
 
 init(_) ->
     process_flag(trap_exit, true),
-    ets:new(couchbeam_uuids, [named_table, public, {keypos, 2}]),
+    _TID = ets:new(couchbeam_uuids, [named_table, public, {keypos, 2}]),
     {ok, #state{}}.
 
 handle_call({get_uuids, #server{host=Host, port=Port}=Server, Count},
@@ -105,7 +104,7 @@ get_new_uuids(Server=#server{host=Host, port=Port,
     Url = couchbeam:make_url(Server, "_uuids", [{"count", Count}]),
     case couchbeam_httpc:request(get, Url, ["200"], IbrowseOptions) of
         {ok, _Status, _Headers, Body} ->
-            {[{<<"uuids">>, Uuids}]} = couchbeam_ejson:decode(Body),
+            {[{<<"uuids">>, Uuids}]} = ejson:decode(Body),
             ServerUuids = #server_uuids{host_port={Host,
                         Port}, uuids=(Acc ++ Uuids)},
                 ets:insert(couchbeam_uuids, ServerUuids),

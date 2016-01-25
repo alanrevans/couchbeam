@@ -6,7 +6,7 @@
 -module(couchbeam_view).
 -author('Benoît Chesneau <benoitc@e-engura.org>').
 
--include("couchbeam.hrl").
+-include_lib("couchbeam/include/couchbeam.hrl").
 
 -export([stream/2, stream/3, stream/4,
          fetch/1, fetch/2, fetch/3,
@@ -36,8 +36,10 @@ fetch(Db) ->
     fetch(Db, 'all_docs', []).
 
 -spec fetch(Db::db(), ViewName::'all_docs' | {DesignName::string(),
-        ViewName::string()})
-    -> {ok, Rows::list(ejson_object())} | {error, term()}.
+        ViewName::string()}) ->
+                   {ok, list(ejson_object())} |
+                   {error, term()} |
+                   {error, list(ejson_object()), term()}.
 %% @equiv fetch(Db, ViewName, [])
 fetch(Db, ViewName) ->
     fetch(Db, ViewName,[]).
@@ -64,12 +66,9 @@ fetch(Db, ViewName) ->
 %% <p>Return: {ok, Rows} or {error, Rows, Error}</p>
 fetch(Db, ViewName, Options) ->
     case stream(Db, ViewName, self(), Options) of
-        {ok, StartRef, _} ->
-            collect_view_results(StartRef, []);
-        Error ->
-            Error
+        {ok, StartRef, _O} -> collect_view_results(StartRef, []);
+        Error -> Error
     end.
-
 
 -spec stream(Db::db(), Client::pid()) -> {ok, StartRef::term(),
         ViewPid::pid()} | {error, term()}.
@@ -146,39 +145,42 @@ stream(Db, ViewName, Client) ->
 %% used to disctint all changes from this pid. ViewPid is the pid of
 %% the view loop process. Can be used to monitor it or kill it
 %% when needed.</p>
+
+build_stream_user_fun(ClientPid, StartRef) ->
+    fun(done) -> ClientPid ! {row, StartRef, done};
+       ({error, Error}) -> ClientPid ! {error, StartRef, Error};
+       (Row) -> ClientPid ! {row, StartRef, Row}
+    end.
+
+build_stream_fun(IbrowseOpts, ClientPid) ->
+    fun(Args, Url) ->
+            StartRef = make_ref(),
+            UserFun = build_stream_user_fun(ClientPid, StartRef),
+
+            Params = {Args, Url, IbrowseOpts},
+            ViewPid = spawn_link(couchbeam_view, view_loop, [UserFun, Params]),
+
+            %% if we send multiple keys, we do a Post
+            Result = case Args#view_query_args.method of
+                         get ->
+                             couchbeam_httpc:request_stream({ViewPid, once}, get, Url, IbrowseOpts);
+                         post ->
+                             Body = ejson:encode({[{<<"keys">>, Args#view_query_args.keys}]}),
+                             Headers = [{"Content-Type", "application/json"}],
+                             couchbeam_httpc:request_stream({ViewPid, once}, post, Url,
+                                                            IbrowseOpts, Headers, Body)
+                     end,
+
+            case Result of
+                {ok, ReqId} ->
+                    ViewPid ! {ibrowse_req_id, ReqId},
+                    {ok, StartRef, ViewPid};
+                Error -> Error
+            end
+    end.
+
 stream(#db{options=IbrowseOpts}=Db, ViewName, ClientPid, Options) ->
-    make_view(Db, ViewName, Options, fun(Args, Url) ->
-        StartRef = make_ref(),
-        UserFun = fun
-            (done) ->
-                ClientPid ! {row, StartRef, done};
-            ({error, Error}) ->
-                ClientPid ! {error, StartRef, Error};
-            (Row) ->
-                ClientPid ! {row, StartRef, Row}
-        end,
-        Params = {Args, Url, IbrowseOpts},
-        ViewPid = spawn_link(couchbeam_view, view_loop, [UserFun, Params]),
-
-        %% if we send multiple keys, we do a Post
-        Result = case Args#view_query_args.method of
-            get ->
-                couchbeam_httpc:request_stream({ViewPid, once}, get, Url, IbrowseOpts);
-            post ->
-                Body = couchbeam_ejson:encode({[{<<"keys">>, Args#view_query_args.keys}]}),
-                Headers = [{"Content-Type", "application/json"}],
-                couchbeam_httpc:request_stream({ViewPid, once}, post, Url,
-                    IbrowseOpts, Headers, Body)
-        end,
-
-        case Result of
-            {ok, ReqId} ->
-                ViewPid ! {ibrowse_req_id, ReqId},
-                {ok, StartRef, ViewPid};
-            Error ->
-                Error
-        end
-    end).
+    make_view(Db, ViewName, Options, build_stream_fun(IbrowseOpts, ClientPid)).
 
 -spec count(Db::db()) -> integer() | {error, term()}.
 %% @equiv count(Db, 'all_docs', [])
@@ -201,14 +203,14 @@ count(#db{options=IbrowseOpts}=Db, ViewName, Options)->
             get ->
                 couchbeam_httpc:request(get, Url, ["200"], IbrowseOpts);
             post ->
-                Body = couchbeam_ejson:encode({[{<<"keys">>, Args#view_query_args.keys}]}),
+                Body = ejson:encode({[{<<"keys">>, Args#view_query_args.keys}]}),
                 Headers = [{"Content-Type", "application/json"}],
                 couchbeam_httpc:request_stream(post, Url, ["200"],
                     IbrowseOpts, Headers, Body)
         end,
         case Result of
             {ok, _, _, RespBody} ->
-                {Props} = couchbeam_ejson:decode(RespBody),
+                {Props} = ejson:decode(RespBody),
                 case proplists:get_value("limit",
                         Args#view_query_args.options, 0) of
                 0 ->
@@ -262,17 +264,17 @@ first(Db, ViewName, Options) ->
             Error
     end.
 
--spec fold(Function::function(), Acc::any(), Db::db(),
-        ViewName::'all_docs' | {DesignName::string(), ViewName::string()})
-    -> list(term()) | {error, term()}.
+-spec fold(Function::function(), Acc::list(), Db::db(),
+           ViewName::'all_docs' | {DesignName::string(), ViewName::string()})
+          -> list(term()) | {error, term()}.
 %% @equiv fold(Function, Acc, Db, ViewName, [])
 fold(Function, Acc, Db, ViewName) ->
     fold(Function, Acc, Db, ViewName, []).
 
--spec fold(Function::function(), Acc::any(), Db::db(),
-        ViewName::'all_docs' | {DesignName::string(),
-        ViewName::string()}, Options::view_options())
-    -> list(term()) | {error, term()}.
+-spec fold(Function::function(), Acc::list(), Db::db(),
+           ViewName::'all_docs' | {DesignName::string(),
+                                   ViewName::string()}, Options::view_options())
+          -> list(term()) | {error, term()}.
 %% @doc call Function(Row, AccIn) on succesive row, starting with
 %% AccIn == Acc. Function/2 must return a new list accumultator or the
 %% atom <em>done</em> to stop fetching results. Acc0 is returned if the
@@ -289,26 +291,26 @@ fold(Function, Acc, Db, ViewName, Options) ->
     end.
 
 -spec foreach(Function::function(), Db::db(),
-        ViewName::'all_docs' | {DesignName::string(), ViewName::string()})
-    -> list(term()) | {error, term()}.
+              ViewName::'all_docs' | {DesignName::string(), ViewName::string()})
+             -> list(term()) | {error, term()}.
 %% @equiv foreach(Function, Db, ViewName, [])
 foreach(Function, Db, ViewName) ->
     foreach(Function, Db, ViewName, []).
 
 -spec foreach(Function::function(),  Db::db(),
-        ViewName::'all_docs' | {DesignName::string(),
-        ViewName::string()}, Options::view_options())
-    -> list(term()) | {error, term()}.
+              ViewName::'all_docs' | {DesignName::string(),
+                                      ViewName::string()}, Options::view_options())
+             -> list(term()) | {error, term()}.
 %% @doc call Function(Row) on succesive row. Example:
 %% ```
 %% couchbeam_view:foreach(fun(Row) -> io:format("got row ~p~n", [Row]) end, Db, 'all_docs').
 %% '''
 foreach(Function, Db, ViewName, Options) ->
-    FunWrapper = fun(Row, _Acc) ->
-            Function(Row),
-            ok
-    end,
-    fold(FunWrapper, ok, Db, ViewName, Options).
+    FunWrapper = fun(Row, Acc) ->
+                         Function(Row),
+                         Acc
+                 end,
+    fold(FunWrapper, [], Db, ViewName, Options).
 
 
 %% ----------------------------------
@@ -323,75 +325,72 @@ parse_view_options(Options) ->
 parse_view_options([], Args) ->
     Args;
 parse_view_options([{key, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{key, couchbeam_ejson:encode(Value)}|Opts],
+    Opts1 = [{"key", ejson:encode(Value)}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
-parse_view_options([{start_docid, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{start_docid, Value}|Opts],
+parse_view_options([{startkey_docid, Value}|Rest], #view_query_args{options=Opts}=Args) ->
+    Opts1 = [{"startkey_docid", Value}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
-parse_view_options([{end_docid, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{end_docid, Value}|Opts],
-    parse_view_options(Rest, Args#view_query_args{options=Opts1});
-parse_view_options([{start_key, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{start_key, couchbeam_ejson:encode(Value)}|Opts],
-    parse_view_options(Rest, Args#view_query_args{options=Opts1});
-parse_view_options([{end_key, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{end_key, couchbeam_ejson:encode(Value)}|Opts],
+parse_view_options([{endkey_docid, Value}|Rest], #view_query_args{options=Opts}=Args) ->
+    Opts1 = [{"endkey_docid", Value}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{startkey, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{startkey, couchbeam_ejson:encode(Value)}|Opts],
+    Opts1 = [{"startkey", ejson:encode(Value)}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{endkey, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{endkey, couchbeam_ejson:encode(Value)}|Opts],
+    Opts1 = [{"endkey", ejson:encode(Value)}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{limit, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{limit, Value}|Opts],
+    Opts1 = [{"limit", Value}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{stale, ok}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{stale, "ok"}|Opts],
+    Opts1 = [{"stale", "ok"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{stale, update_after}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{stale, "update_after"}|Opts],
+    Opts1 = [{"stale", "update_after"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{stale, _}|_Rest], _Args) ->
     {error, "invalid stale value"};
 parse_view_options([descending|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{descending, "true"}|Opts],
+    Opts1 = [{"descending", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([group|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{group, "true"}|Opts],
+    Opts1 = [{"group", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{group_level, Level}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{group_level, Level}|Opts],
+    Opts1 = [{"group_level", Level}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([inclusive_end|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{inclusive_end, "true"}|Opts],
+    Opts1 = [{"inclusive_end", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{inclusive_end, true}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{inclusive_end, "true"}|Opts],
+    Opts1 = [{"inclusive_end", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{inclusive_end, false}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{inclusive_end, "false"}|Opts],
+    Opts1 = [{"inclusive_end", "false"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([reduce|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{reduce, "true"}|Opts],
+    Opts1 = [{"reduce", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{reduce, true}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{reduce, "true"}|Opts],
+    Opts1 = [{"reduce", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{reduce, false}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{reduce, "false"}|Opts],
+    Opts1 = [{"reduce", "false"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([include_docs|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{include_docs, "true"}|Opts],
+    Opts1 = [{"include_docs", "true"}|Opts],
+    parse_view_options(Rest, Args#view_query_args{options=Opts1});
+parse_view_options([{include_docs, _}|Rest], #view_query_args{options=Opts}=Args) ->
+    Opts1 = [{"include_docs", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([conflicts|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{conflicts, "true"}|Opts],
+    Opts1 = [{"conflicts", "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{skip, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{skip, Value}|Opts],
+    Opts1 = [{"skip", Value}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{list, Value}|Rest], #view_query_args{options=Opts}=Args) ->
-    Opts1 = [{list, Value}|Opts],
+    Opts1 = [{"list", Value}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{keys, Value}|Rest], Args) ->
     parse_view_options(Rest, Args#view_query_args{method=post,
@@ -400,40 +399,57 @@ parse_view_options([{Key, Value}|Rest], #view_query_args{options=Opts}=Args)
         when is_list(Key) ->
     Opts1 = [{Key, Value}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
+parse_view_options([{<<_/binary>> = Key, Value}|Rest], Args) ->
+    parse_view_options([{list_to_existing_atom(binary_to_list(Key)), Value}|Rest], Args);
 parse_view_options([_|Rest], Args) ->
     parse_view_options(Rest, Args).
 
-
 view_loop(UserFun, Params) ->
     Callback = fun(200, _Headers, DataStreamFun) ->
-            EventFun = fun(Ev) ->
-                    view_ev1(Ev, UserFun)
-            end,
-            couchbeam_json_stream:events(DataStreamFun, EventFun)
-    end,
-
+                       EventFun = fun(Ev) -> view_ev1(Ev, UserFun) end,
+                       couchbeam_json_stream:events(DataStreamFun, EventFun);
+                  (Code, _Headers, _DataStreamFun) ->
+                       throw({failure, Code})
+               end,
+    
     receive
         {ibrowse_req_id, ReqId} ->
             process_view_results(ReqId, Params, UserFun, Callback)
     after ?DEFAULT_TIMEOUT ->
-        UserFun({error, timeout})
+            UserFun({error, timeout})
     end.
 
 
 %% @private
 
 make_view(#db{server=Server}=Db, ViewName, Options, Fun) ->
-    Args = parse_view_options(Options),
+    #view_query_args{options=Options1}=Args = parse_view_options(Options),
     case ViewName of
         'all_docs' ->
             Url = couchbeam:make_url(Server, [couchbeam:db_url(Db),
-                    "/_all_docs"],
-                    Args#view_query_args.options),
+                                              "/_all_docs"],
+                                     Options1),
+            Fun(Args, Url);
+        'design_docs' ->
+            Url = couchbeam:make_url(Server, [couchbeam:db_url(Db)
+                                              ,"/_all_docs"
+                                             ],
+                                     [{startkey, "\"_design\""}
+                                      ,{endkey, "\"_design0\""}
+                                      | Options1
+                                     ]),
             Fun(Args, Url);
         {DName, VName} ->
             Url = couchbeam:make_url(Server, [couchbeam:db_url(Db),
-                    "/_design/", DName, "/_view/", VName],
-                    Args#view_query_args.options),
+                                              "/_design/", DName, "/_view/", VName],
+                                     Options1),
+            Fun(Args, Url);
+        <<_/binary>> ->
+            [DName, VName] = binary:split(ViewName, <<"/">>),
+
+            Url = couchbeam:make_url(Server, [couchbeam:db_url(Db),
+                                              "/_design/", DName, "/_view/", VName],
+                                     Options1),
             Fun(Args, Url);
         _ ->
             {error, invalid_view_name}
@@ -441,8 +457,7 @@ make_view(#db{server=Server}=Db, ViewName, Options, Fun) ->
 
 collect_view_first(Ref, Pid) ->
     receive
-        {row, Ref, done} ->
-            {error, empty};
+        {row, Ref, done} -> {error, empty};
         {row, Ref, Row} ->
             couchbeam_util:shutdown_sync(Pid),
             {ok, Row};
@@ -451,6 +466,9 @@ collect_view_first(Ref, Pid) ->
     end.
 
 
+-spec fold_view_results/4 :: (_, pid(), fun(), Acc) ->
+                                     Acc |
+                                     {error, Acc, _}.
 fold_view_results(Ref, Pid, Fun, Acc) ->
     receive
         {row, Ref, done} ->
@@ -488,26 +506,26 @@ process_view_results(ReqId, Params, UserFun, Callback) ->
             case list_to_integer(Code) of
                 Ok when Ok =:= 200 ; Ok =:= 201 ; (Ok >= 400 andalso Ok < 500) ->
                     StreamDataFun = fun() ->
-                        process_view_results1(ReqId, UserFun, Callback)
-                    end,
-                    ibrowse:stream_next(IbrowseRef),
+                                            process_view_results1(ReqId, UserFun, Callback)
+                                    end,
+                    _ = ibrowse:stream_next(IbrowseRef),
                     try
-                        Callback(Ok, Headers, StreamDataFun),
+                        _C = Callback(Ok, Headers, StreamDataFun),
                         couchbeam_httpc:clean_mailbox_req(ReqId)
                     catch
                         throw:http_response_end -> ok;
-                        _:Error ->
+                        throw:Error ->
                             UserFun({error, Error})
                     after
-                        ibrowse:stream_close(ReqId)
+                        _ = ibrowse:stream_close(ReqId)
                     end,
                     ok;
                 R when R =:= 301 ; R =:= 302 ; R =:= 303 ->
                     do_redirect(Headers, UserFun, Callback, Params),
-                    ibrowse:stream_close(ReqId);
+                    _ = ibrowse:stream_close(ReqId);
                 Error ->
-                    UserFun({error, {http_error, {status,
-                                    Error}}})
+                    _ = ibrowse:stream_close(ReqId),
+                    UserFun({error, {http_error, {status, Error}}})
 
             end;
         {ibrowse_async_response, ReqId, {error, _} = Error} ->
@@ -519,10 +537,10 @@ process_view_results1(ReqId, UserFun, Callback) ->
         {ibrowse_async_response, ReqId, {error, Error}} ->
             UserFun({error, Error});
         {ibrowse_async_response, ReqId, <<>>} ->
-            ibrowse:stream_next(ReqId),
+            _ = ibrowse:stream_next(ReqId),
             process_view_results1(ReqId, UserFun, Callback);
         {ibrowse_async_response, ReqId, Data} ->
-            ibrowse:stream_next(ReqId),
+            _ = ibrowse:stream_next(ReqId),
             {Data, fun() -> process_view_results1(ReqId, UserFun, Callback) end};
         {ibrowse_async_response_end, ReqId} ->
             UserFun(done),
@@ -538,7 +556,7 @@ do_redirect(Headers, UserFun, Callback, {Args, Url, IbrowseOpts}) ->
         get ->
             couchbeam_httpc:request_stream({self(), once}, get, RedirectUrl, IbrowseOpts);
         post ->
-            Body = couchbeam_ejson:encode({[{<<"keys">>, Args#view_query_args.keys}]}),
+            Body = ejson:encode({[{<<"keys">>, Args#view_query_args.keys}]}),
             Headers = [{"Content-Type", "application/json"}],
             couchbeam_httpc:request_stream({self(), once}, get, RedirectUrl,
                 IbrowseOpts, Headers, Body)
@@ -557,7 +575,7 @@ view_ev1(object_start, UserFun) ->
 
 view_ev2({key, <<"rows">>}, UserFun) ->
     fun(Ev) -> view_ev3(Ev, UserFun) end;
-view_ev2(_, UserFun) ->
+view_ev2(_O, UserFun) ->
     fun(Ev) -> view_ev2(Ev, UserFun) end.
 
 view_ev3(array_start, UserFun) ->
@@ -565,11 +583,13 @@ view_ev3(array_start, UserFun) ->
 
 view_ev_loop(object_start, UserFun) ->
     fun(Ev) ->
-        couchbeam_json_stream:collect_object(Ev,
-            fun(Obj) ->
-                UserFun(Obj),
-                fun(Ev2) -> view_ev_loop(Ev2, UserFun) end
-            end)
+            couchbeam_json_stream:collect_object(Ev,
+                                                 fun(Obj) ->
+                                                         UserFun(Obj),
+                                                         fun(Ev2) ->
+                                                                 view_ev_loop(Ev2, UserFun)
+                                                         end
+                                                 end)
     end;
 view_ev_loop(array_end, UserFun) ->
     UserFun(done),
@@ -577,4 +597,3 @@ view_ev_loop(array_end, UserFun) ->
 
 view_ev_done() ->
     fun(_Ev) -> view_ev_done() end.
-

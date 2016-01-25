@@ -5,7 +5,7 @@
 
 -module(couchbeam_changes).
 
--include("couchbeam.hrl").
+-include_lib("couchbeam/include/couchbeam.hrl").
 -include_lib("ibrowse/include/ibrowse.hrl").
 
 -export([stream/2, stream/3,
@@ -50,22 +50,18 @@ stream(Db, Client) ->
 %%    | include_docs | {since, integer()}
 %%    | {timeout, integer()}
 %%    | heartbeat | {heartbeat, integer()}
-%%    | {filter, string()} | {filter, string(), list({string(), string() | integer()})}
-%%    | {view, string()}]</pre>
+%%    | {filter, string()} | {filter, string(), list({string(), string() | integer()}</pre>
 %%
 %%   <ul>
 %%      <li><code>continuous | longpoll | normal</code>: set the type of changes
 %%          feed to get</li>
 %%      <li><code>include_doc</code>: if you want to include the doc in the line of
 %%          change</li>
-%%      <li><code>{timeout, Timeout::integer()}</code>: timeout</li>
+%%      <li><code>{timeout, Timeout::integer()}</code>:: timeout</li>
 %%      <li><code>heartbeat | {heartbeat, Heartbeat::integer()}</code>: set couchdb
 %%          to send a heartbeat to maintain connection open</li>
 %%      <li><code>{filter, FilterName} | {filter, FilterName, Args::list({key,
-%%          value})}</code>: set the filter to use with optional arguments</li>
-%%      <li><code>{view, ViewName}</code>: use a view function as filter. Note
-%%          that it requires to set filter special value <code>"_view"</code>
-%%          to enable this feature.</li>
+%%          value})</code>: set the filter to use with optional arguments</li>
 %%   </ul></p>
 %%
 %% <p> Return {ok, StartRef, ChangesPid} or {error, Error}. Ref can be
@@ -116,7 +112,7 @@ stream(Db, Fun, Options) ->
 fetch(Db) ->
     fetch(Db, []).
 
--spec fetch(Db::db(), Options::changes_options()) -> {ok,
+-spec fetch(Db::db(), Options::changes_options1()) -> {ok,
         LastSeq::integer(), Rows::list()} | {error,  LastSeq::integer(),
         Error::term()}.
 %% @doc Collect Changes. Could be used to make a blocking call to a
@@ -126,7 +122,7 @@ fetch(Db) ->
 %%    | include_docs | {since, integer()}
 %%    | {timeout, integer()}
 %%    | heartbeat | {heartbeat, integer()}
-%%    | {filter, string()} | {filter, string(), list({string(), string() | integer()})}]</pre>
+%%    | {filter, string()} | {filter, string(), list({string(), string() | integer()}</pre>
 %%
 %%   <ul>
 %%      <li><code>longpoll | normal</code>: set the type of changes
@@ -138,12 +134,9 @@ fetch(Db) ->
 %%          to send a heartbeat to maintain connection open</li>
 %%      <li><code>{filter, FilterName} | {filter, FilterName, Args::list({key,
 %%          value})</code>: set the filter to use with optional arguments</li>
-%%      <li><code>{view, ViewName}</code>: use a view function as filter. Note
-%%          that it requires to set filter special value <code>"_view"</code>
-%%          to enable this feature.</li>
 %%   </ul></p>
 %%
-%% <p>Result: <code>{ok, LastSeq::integer(), Rows::list()}</code> or
+%% <p>Resut: <code>{ok, LastSeq::integer(), Rows::list()}</code> or
 %% <code>{error, LastSeq, Error}</code>. LastSeq is the last sequence of changes.</p>
 fetch(Db, Options) ->
     case stream(Db, self(), Options) of
@@ -187,9 +180,6 @@ parse_changes_options([{heartbeat, Heartbeat}|Rest], #changes_args{http_options=
     parse_changes_options(Rest, Args#changes_args{http_options=Opts1});
 parse_changes_options([heartbeat|Rest], #changes_args{http_options=Opts} = Args) ->
     Opts1 = [{"heartbeat", "true"}|Opts],
-    parse_changes_options(Rest, Args#changes_args{http_options=Opts1});
-parse_changes_options([{view, ViewName}|Rest], #changes_args{http_options=Opts} = Args) ->
-    Opts1 = [{"view", ViewName}|Opts],
     parse_changes_options(Rest, Args#changes_args{http_options=Opts1});
 parse_changes_options([{filter, FilterName}|Rest], #changes_args{http_options=Opts} = Args) ->
     Opts1 = [{"filter", FilterName}|Opts],
@@ -293,7 +283,7 @@ process_changes(ReqId, Params, UserFun, Callback) ->
                     end,
                     ibrowse:stream_next(IbrowseRef),
                     try
-                        Callback(Ok, Headers, StreamDataFun),
+                        _ = Callback(Ok, Headers, StreamDataFun),
                         couchbeam_httpc:clean_mailbox_req(ReqId)
                     catch
                         throw:http_response_end -> ok;
@@ -315,18 +305,18 @@ process_changes(ReqId, Params, UserFun, Callback) ->
 
 process_changes1(ReqId, UserFun, Callback) ->
     receive
-    {ibrowse_async_response, ReqId, {error, Error}} ->
-        UserFun({error, Error});
+        {ibrowse_async_response, ReqId, {error, Error}} ->
+            UserFun({error, Error});
     {ibrowse_async_response, ReqId, <<>>} ->
-        ibrowse:stream_next(ReqId),
-        process_changes1(ReqId, UserFun, Callback);
-    {ibrowse_async_response, ReqId, Data} ->
-        ibrowse:stream_next(ReqId),
-        {Data, fun() -> process_changes1(ReqId, UserFun, Callback) end};
+            ibrowse:stream_next(ReqId),
+            process_changes1(ReqId, UserFun, Callback);
+        {ibrowse_async_response, ReqId, Data} ->
+            ibrowse:stream_next(ReqId),
+            {Data, fun() -> process_changes1(ReqId, UserFun, Callback) end};
     {ibrowse_async_response_end, ReqId} ->
-        UserFun(done),
-        {<<"">>, fun() -> throw(http_response_end) end}
-end.
+            UserFun(done),
+            {<<"">>, fun() -> throw(http_response_end) end}
+    end.
 
 
 do_redirect(Headers, UserFun, Callback, {Url, IbrowseOpts}) ->
